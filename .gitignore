@@ -1,0 +1,23 @@
+# Ambientes e dependências locais
+backend/.env
+backend/.venv/
+frontend/.env
+frontend/node_modules/
+
+# Artefatos gerados
+frontend/dist/
+frontend/*.tsbuildinfo
+backend/output/*.csv
+backend/output/*.json
+!backend/output/.gitkeep
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Sistema/editor
+.DS_Store
+Thumbs.db
+*.tmp
+*.local
