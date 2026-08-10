@@ -1,0 +1,26 @@
+[Unit]
+Description=Zabbix Automation - Backend (FastAPI/Uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=zabbixauto
+Group=zabbixauto
+WorkingDirectory=/opt/zabbix_automation/backend
+# O .env é carregado pelo próprio app (python-dotenv), não é preciso EnvironmentFile aqui.
+ExecStart=/opt/zabbix_automation/backend/.venv/bin/python -m uvicorn src.api:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+# Endurecimento básico do serviço
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/zabbix_automation/backend/output /opt/zabbix_automation/logs
+
+StandardOutput=append:/opt/zabbix_automation/logs/backend.log
+StandardError=append:/opt/zabbix_automation/logs/backend.error.log
+
+[Install]
+WantedBy=multi-user.target

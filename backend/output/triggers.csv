@@ -1,0 +1,3 @@
+triggerid,description,status,value,hostids
+13075,Zabbix server: More than 95% used in the value cache,0,0,10084
+13558,Zabbix server: Zabbix value cache working in low memory mode,0,0,10084

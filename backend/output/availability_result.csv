@@ -1,0 +1,2 @@
+triggerid,trigger_name,period_start,period_end,timezone,initial_state,total_seconds,ok_seconds,problem_seconds,availability_percent,problem_percent,incident_count,max_problem_seconds,calculation_status,maintenance_considered,calculated_at
+13479,Zabbix server: Utilization of poller processes is high,2026-03-01T00:00:00-03:00,2026-05-20T23:59:59-03:00,America/Sao_Paulo,OK,6998399,6998035,364,99.9948,0.0052,2,203,OK,NO,2026-05-21T17:06:29.334317-03:00

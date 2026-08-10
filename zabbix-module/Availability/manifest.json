@@ -1,0 +1,16 @@
+{
+    "manifest_version": 2.0,
+    "id": "zabbix_availability_module",
+    "name": "Disponibilidade por Trigger",
+    "namespace": "Availability",
+    "version": "1.0",
+    "author": "Zabbix Automation",
+    "url": "",
+    "description": "Adiciona um menu para acessar a aplicacao de calculo de disponibilidade por host/trigger diretamente de dentro do Zabbix.",
+    "actions": {
+        "availability.view": {
+            "class": "AvailabilityView",
+            "view": "availability.view"
+        }
+    }
+}
