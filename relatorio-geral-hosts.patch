@@ -1,0 +1,737 @@
+diff --git a/backend/src/api/app.py b/backend/src/api/app.py
+index 606b593..4a30e51 100644
+--- a/backend/src/api/app.py
++++ b/backend/src/api/app.py
+@@ -16,6 +16,7 @@ from ..core.logging_config import configure_logging, get_logger, set_request_id
+ from ..integrations.zabbix_client import ZabbixClient, ZabbixClientError, ZabbixHttpError, ZabbixJsonRpcError
+ from ..services.availability_service import AvailabilityService
+ from .auth import InMemorySessionStore, clear_session_cookie, set_session_cookie
++from .report_jobs import ReportJobStore
+ from .routes import build_router
+ from .schemas import AuthSessionResponse, LoginRequest, SsoLoginRequest
+ 
+@@ -32,6 +33,7 @@ def create_app(
+     app.state.service_factory = service_factory
+     app.state.zabbix_client_factory = zabbix_client_factory or ZabbixClient
+     app.state.sessions = InMemorySessionStore()
++    app.state.report_jobs = ReportJobStore()
+     app.add_middleware(
+         CORSMiddleware,
+         allow_origins=get_cors_origins(),
+@@ -198,6 +200,7 @@ def create_app(
+             session_status=session_status,
+             terminate_session=terminate_session,
+             require_authentication=require_authentication,
++            report_jobs=app.state.report_jobs,
+         )
+     )
+     return app
+diff --git a/backend/src/api/report_jobs.py b/backend/src/api/report_jobs.py
+new file mode 100644
+index 0000000..8842793
+--- /dev/null
++++ b/backend/src/api/report_jobs.py
+@@ -0,0 +1,61 @@
++from __future__ import annotations
++
++import threading
++import time
++import uuid
++from collections.abc import Callable
++from dataclasses import dataclass, field
++
++
++@dataclass
++class ReportJob:
++    id: str
++    status: str = "PENDING"  # PENDING | RUNNING | DONE | ERROR
++    total: int = 0
++    completed: int = 0
++    result: object | None = None
++    error: str | None = None
++    created_at: float = field(default_factory=time.time)
++
++
++# Executa relatorios longos (muitos hosts/triggers) em background, fora do
++# ciclo request/response HTTP -- evita estourar o timeout do proxy
++# (Nginx/Apache) e do Uvicorn em relatorios que levam minutos. Guardado em
++# memoria (mesmo padrao de InMemorySessionStore em auth.py): nao sobrevive
++# a restart, nao escala com multiplos workers -- suficiente para o uso
++# local/single-instance desta aplicacao.
++class ReportJobStore:
++    def __init__(self, ttl_seconds: int = 3600) -> None:
++        self.ttl_seconds = ttl_seconds
++        self._jobs: dict[str, ReportJob] = {}
++        self._lock = threading.Lock()
++
++    def create(self) -> ReportJob:
++        self._cleanup_expired()
++        job = ReportJob(id=uuid.uuid4().hex)
++        with self._lock:
++            self._jobs[job.id] = job
++        return job
++
++    def get(self, job_id: str) -> ReportJob | None:
++        with self._lock:
++            return self._jobs.get(job_id)
++
++    def run_async(self, job: ReportJob, target: Callable[[ReportJob], object]) -> None:
++        def worker() -> None:
++            job.status = "RUNNING"
++            try:
++                job.result = target(job)
++                job.status = "DONE"
++            except Exception as exc:  # relatado ao frontend via /status, nao derruba o processo
++                job.error = str(exc)
++                job.status = "ERROR"
++
++        threading.Thread(target=worker, daemon=True).start()
++
++    def _cleanup_expired(self) -> None:
++        now = time.time()
++        with self._lock:
++            expired = [jid for jid, job in self._jobs.items() if now - job.created_at > self.ttl_seconds]
++            for jid in expired:
++                self._jobs.pop(jid, None)
+diff --git a/backend/src/api/routes.py b/backend/src/api/routes.py
+index b06b08a..d7dca69 100644
+--- a/backend/src/api/routes.py
++++ b/backend/src/api/routes.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ from dataclasses import asdict
+ 
+-from fastapi import APIRouter, Depends, Query, Request, Response
++from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+ 
+ from ..services.availability_service import (
+     AvailabilityService,
+@@ -14,6 +14,7 @@ from ..services.availability_service import (
+     TriggerSummary,
+ )
+ from .dependencies import build_window, verify_internal_api_key
++from .report_jobs import ReportJobStore
+ from .schemas import (
+     AvailabilityRequest,
+     AvailabilityResultResponse,
+@@ -28,12 +29,16 @@ from .schemas import (
+     HostAvailabilityRequest,
+     HostAvailabilityResponse,
+     HostResponse,
++    HostsQuery,
+     HostsResponse,
+     LoginRequest,
++    ReportJobStartResponse,
++    ReportJobStatusResponse,
+     SsoLoginRequest,
+     TimelineIntervalResponse,
+     TimelineResponse,
+     TriggerGroupResponse,
++    TriggerGroupsQuery,
+     TriggerGroupsResponse,
+     TriggerResponse,
+     TriggersResponse,
+@@ -45,7 +50,15 @@ from .schemas import (
+ # de DI) para nao criar dependencia circular entre routes.py e app.py.
+ # `protected` e a lista de dependencias aplicada a toda rota que exige
+ # sessao ativa (cookie) + a chave interna opcional (X-Internal-API-Key).
+-def build_router(get_service, authenticate, sso_authenticate, session_status, terminate_session, require_authentication) -> APIRouter:
++def build_router(
++    get_service,
++    authenticate,
++    sso_authenticate,
++    session_status,
++    terminate_session,
++    require_authentication,
++    report_jobs: ReportJobStore,
++) -> APIRouter:
+     router = APIRouter()
+     protected = [Depends(require_authentication), Depends(verify_internal_api_key)]
+ 
+@@ -223,6 +236,101 @@ def build_router(get_service, authenticate, sso_authenticate, session_status, te
+         )
+         return _group_trigger_availability_response(calculation)
+ 
++    # --- Listagens via POST (corpo, nao query string) -- mesma logica das
++    # rotas GET acima (/api/hosts, /api/triggers), mas usadas quando a
++    # selecao de groupids/hostids e grande o suficiente para estourar o
++    # limite de tamanho de URL (HTTP 414) em uma query string repetida
++    # (ex.: centenas/milhares de hosts selecionados). O frontend usa estas
++    # rotas por padrao (ver frontend/src/api.ts). ---
++    @router.post("/api/hosts/search", response_model=HostsResponse, dependencies=protected)
++    def search_hosts(
++        payload: HostsQuery,
++        service: AvailabilityService = Depends(get_service),
++    ) -> HostsResponse:
++        hosts = (
++            service.list_hosts_by_groups(payload.groupids, search=payload.search, limit=payload.limit)
++            if payload.groupids
++            else service.list_hosts(search=payload.search, limit=payload.limit)
++        )
++        return HostsResponse(count=len(hosts), hosts=[_host_response(host) for host in hosts])
++
++    @router.post("/api/triggers/search", response_model=TriggerGroupsResponse, dependencies=protected)
++    def search_trigger_groups(
++        payload: TriggerGroupsQuery,
++        service: AvailabilityService = Depends(get_service),
++    ) -> TriggerGroupsResponse:
++        triggers = service.list_trigger_groups(
++            group_ids=payload.groupids,
++            host_ids=payload.hostids,
++            search=payload.search,
++            host_limit=payload.host_limit,
++            trigger_limit=payload.trigger_limit,
++        )
++        return TriggerGroupsResponse(count=len(triggers), triggers=[_trigger_group_response(t) for t in triggers])
++
++    # --- Relatorio geral (muitos hosts/triggers, ex.: todos os hosts
++    # monitorados): roda em background e devolve um job_id imediatamente.
++    # O frontend faz polling de /status ate DONE e entao busca /result.
++    # Isso evita manter uma requisicao HTTP aberta por minutos (o proxy
++    # Nginx/Apache e o Uvicorn tem timeouts que nao suportariam isso) e da
++    # progresso real ao usuario. O calculo em si usa
++    # calculate_trigger_groups_batched(), que agrupa varias triggers por
++    # chamada ao Zabbix e pausa deliberadamente entre lotes -- ver
++    # AvailabilityService e core/config.py (REPORT_CHUNK_SIZE,
++    # REPORT_CHUNK_DELAY_SECONDS). ---
++    @router.post("/api/availability/report/start", response_model=ReportJobStartResponse, dependencies=protected)
++    def start_general_report(
++        request: GroupTriggerAvailabilityRequest,
++        service: AvailabilityService = Depends(get_service),
++    ) -> ReportJobStartResponse:
++        window = build_window(request)
++        job = report_jobs.create()
++
++        def run(job_ref) -> dict:
++            def on_progress(completed: int, total: int) -> None:
++                job_ref.completed = completed
++                job_ref.total = total
++
++            calculation = service.calculate_trigger_groups_batched(
++                request.trigger_keys,
++                window=window,
++                group_ids=request.groupids,
++                host_ids=request.hostids,
++                host_limit=request.host_limit,
++                trigger_limit=request.trigger_limit,
++                on_progress=on_progress,
++            )
++            return _group_trigger_availability_response(calculation).model_dump(mode="json")
++
++        report_jobs.run_async(job, run)
++        return ReportJobStartResponse(job_id=job.id)
++
++    @router.get(
++        "/api/availability/report/{job_id}/status",
++        response_model=ReportJobStatusResponse,
++        dependencies=protected,
++    )
++    def report_status(job_id: str) -> ReportJobStatusResponse:
++        job = report_jobs.get(job_id)
++        if job is None:
++            raise HTTPException(status_code=404, detail="Relatorio nao encontrado.")
++        return ReportJobStatusResponse(status=job.status, completed=job.completed, total=job.total, error=job.error)
++
++    @router.get(
++        "/api/availability/report/{job_id}/result",
++        response_model=GroupTriggerAvailabilityResponse,
++        dependencies=protected,
++    )
++    def report_result(job_id: str) -> GroupTriggerAvailabilityResponse:
++        job = report_jobs.get(job_id)
++        if job is None:
++            raise HTTPException(status_code=404, detail="Relatorio nao encontrado.")
++        if job.status == "ERROR":
++            raise HTTPException(status_code=502, detail=job.error or "Falha ao gerar o relatorio.")
++        if job.status != "DONE":
++            raise HTTPException(status_code=409, detail="Relatorio ainda nao esta pronto.")
++        return job.result
++
+     return router
+ 
+ 
+diff --git a/backend/src/api/schemas.py b/backend/src/api/schemas.py
+index 9a51812..e923573 100644
+--- a/backend/src/api/schemas.py
++++ b/backend/src/api/schemas.py
+@@ -201,3 +201,32 @@ class ErrorResponse(BaseModel):
+ 
+ class HealthResponse(BaseModel):
+     status: str
++
++
++# --- Listagens via POST (corpo, nao query string). groupids/hostids como
++# query params repetidos estouravam o limite de tamanho de URL (HTTP 414)
++# em selecoes grandes (ex.: centenas/milhares de hosts). ---
++class HostsQuery(BaseModel):
++    search: str | None = None
++    groupids: list[str] = Field(default_factory=list)
++    limit: int | None = Field(default=None, ge=1)
++
++
++class TriggerGroupsQuery(BaseModel):
++    groupids: list[str] = Field(default_factory=list)
++    hostids: list[str] = Field(default_factory=list)
++    search: str | None = None
++    host_limit: int | None = Field(default=None, ge=1)
++    trigger_limit: int | None = Field(default=None, ge=1)
++
++
++# --- Relatorio geral em background (ver api/report_jobs.py) ---
++class ReportJobStartResponse(BaseModel):
++    job_id: str
++
++
++class ReportJobStatusResponse(BaseModel):
++    status: str
++    completed: int
++    total: int
++    error: str | None = None
+diff --git a/backend/src/core/config.py b/backend/src/core/config.py
+index ff9079d..66b31ee 100644
+--- a/backend/src/core/config.py
++++ b/backend/src/core/config.py
+@@ -24,3 +24,30 @@ def load_project_env() -> None:
+ def get_cors_origins() -> list[str]:
+     raw_origins = os.getenv("CORS_ORIGINS", "http://127.0.0.1:3000,http://localhost:3000")
+     return [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
++
++
++# Quantidade de triggerids agrupados por chamada event.get no relatorio
++# geral (calculate_trigger_groups_batched). Um valor menor gera mais
++# chamadas (mais lento, mais leve por chamada); um valor maior gera menos
++# chamadas, porem cada resposta do Zabbix fica maior. Ajustavel sem
++# redeploy via backend/.env.
++def get_report_chunk_size() -> int:
++    raw = os.getenv("REPORT_CHUNK_SIZE", "150")
++    try:
++        value = int(raw)
++    except ValueError:
++        return 150
++    return value if value > 0 else 150
++
++
++# Pausa deliberada (em segundos) entre lotes do relatorio geral -- existe
++# para nao gerar uma rajada de chamadas na API do Zabbix mesmo estando em
++# lotes; aceita-se um relatorio mais lento em troca de nao impactar o
++# funcionamento normal do Zabbix. Ajustavel via backend/.env.
++def get_report_chunk_delay_seconds() -> float:
++    raw = os.getenv("REPORT_CHUNK_DELAY_SECONDS", "0.3")
++    try:
++        value = float(raw)
++    except ValueError:
++        return 0.3
++    return value if value >= 0 else 0.3
+diff --git a/backend/src/integrations/zabbix_client.py b/backend/src/integrations/zabbix_client.py
+index 14143a5..8087065 100644
+--- a/backend/src/integrations/zabbix_client.py
++++ b/backend/src/integrations/zabbix_client.py
+@@ -273,6 +273,73 @@ class ZabbixClient:
+         parsed_events = [self._to_event(event) for event in events]
+         return sorted(parsed_events, key=lambda event: (event.clock, int(event.eventid)))
+ 
++    def get_last_events_before_batch(
++        self,
++        trigger_ids: list[str],
++        period_start_epoch: int,
++    ) -> dict[str, ZabbixEvent | None]:
++        # Busca o evento imediatamente anterior ao periodo para varias
++        # triggers de uma vez (1 chamada event.get em vez de 1 por trigger).
++        # Usado no relatorio geral (muitos hosts/triggers), onde o numero de
++        # chamadas sequenciais seria proibitivo -- ver
++        # AvailabilityService.calculate_trigger_groups_batched(). Sem
++        # "limit" aqui (limitaria o total, nao por trigger); filtramos
++        # localmente o primeiro evento (mais recente, por causa do DESC) de
++        # cada objectid.
++        result: dict[str, ZabbixEvent | None] = {trigger_id: None for trigger_id in trigger_ids}
++        if period_start_epoch <= 0 or not trigger_ids:
++            return result
++
++        events = self._request(
++            "event.get",
++            {
++                "source": 0,
++                "object": 0,
++                "objectids": trigger_ids,
++                "time_till": period_start_epoch - 1,
++                "output": ["eventid", "clock", "value", "objectid"],
++                "sortfield": ["clock", "eventid"],
++                "sortorder": "DESC",
++            },
++        )
++        for raw_event in events:
++            event = self._to_event(raw_event)
++            if result.get(event.objectid) is None:
++                result[event.objectid] = event
++        return result
++
++    def get_events_in_window_batch(
++        self,
++        trigger_ids: list[str],
++        period_start_epoch: int,
++        period_end_epoch: int,
++    ) -> dict[str, list[ZabbixEvent]]:
++        # Busca os eventos dentro do periodo para varias triggers de uma vez
++        # (mesma motivacao de get_last_events_before_batch acima).
++        result: dict[str, list[ZabbixEvent]] = {trigger_id: [] for trigger_id in trigger_ids}
++        if not trigger_ids:
++            return result
++
++        events = self._request(
++            "event.get",
++            {
++                "source": 0,
++                "object": 0,
++                "objectids": trigger_ids,
++                "time_from": period_start_epoch,
++                "time_till": period_end_epoch,
++                "output": ["eventid", "clock", "value", "objectid"],
++                "sortfield": ["clock", "eventid"],
++                "sortorder": "ASC",
++            },
++        )
++        for raw_event in events:
++            event = self._to_event(raw_event)
++            result.setdefault(event.objectid, []).append(event)
++        for trigger_id, trigger_events in result.items():
++            result[trigger_id] = sorted(trigger_events, key=lambda e: (e.clock, int(e.eventid)))
++        return result
++
+     def _request(
+         self,
+         method: str,
+diff --git a/backend/src/services/availability_service.py b/backend/src/services/availability_service.py
+index 33abbf3..34a8287 100644
+--- a/backend/src/services/availability_service.py
++++ b/backend/src/services/availability_service.py
+@@ -1,9 +1,12 @@
+ from __future__ import annotations
+ 
++import time
++from collections.abc import Callable
+ from dataclasses import dataclass
+ from datetime import datetime
+ from typing import Protocol
+ 
++from ..core.config import get_report_chunk_delay_seconds, get_report_chunk_size
+ from ..domain.availability_calculator import AvailabilityResult, TimelineInterval, calculate_availability
+ from ..integrations.zabbix_client import ZabbixEvent
+ 
+@@ -48,6 +51,19 @@ class ZabbixReadClient(Protocol):
+         period_end_epoch: int,
+     ) -> list[ZabbixEvent]: ...
+ 
++    def get_last_events_before_batch(
++        self,
++        trigger_ids: list[str],
++        period_start_epoch: int,
++    ) -> dict[str, ZabbixEvent | None]: ...
++
++    def get_events_in_window_batch(
++        self,
++        trigger_ids: list[str],
++        period_start_epoch: int,
++        period_end_epoch: int,
++    ) -> dict[str, list[ZabbixEvent]]: ...
++
+ 
+ @dataclass(frozen=True)
+ # --- "Modelos" internos do service (dataclasses), independentes do
+@@ -277,6 +293,9 @@ class AvailabilityService:
+ 
+     # Busca no Zabbix o evento anterior ao periodo + os eventos dentro do
+     # periodo, e delega o calculo em si para o modulo de dominio (puro).
++    # Usado no fluxo pontual (uma ou poucas triggers) -- 2 chamadas ao
++    # Zabbix por trigger. Para muitas triggers de uma vez, ver
++    # calculate_trigger_groups_batched() abaixo.
+     def _calculate_trigger(self, trigger: TriggerSummary, window: AvailabilityWindow) -> TriggerAvailability:
+         previous_event = self.client.get_last_event_before(
+             trigger.triggerid,
+@@ -287,6 +306,21 @@ class AvailabilityService:
+             int(window.period_start.timestamp()),
+             int(window.period_end.timestamp()),
+         )
++        return self._calculate_trigger_from_events(trigger, window, previous_event, events_in_window)
++
++    # Parte pura do calculo (sem I/O): recebe os eventos ja buscados
++    # (individualmente ou em lote) e monta o TriggerAvailability. Extraido
++    # de _calculate_trigger() para ser reaproveitado por
++    # calculate_trigger_groups_batched(), que busca eventos de varias
++    # triggers de uma vez via get_last_events_before_batch/
++    # get_events_in_window_batch.
++    def _calculate_trigger_from_events(
++        self,
++        trigger: TriggerSummary,
++        window: AvailabilityWindow,
++        previous_event: ZabbixEvent | None,
++        events_in_window: list[ZabbixEvent],
++    ) -> TriggerAvailability:
+         result, timeline = calculate_availability(
+             triggerid=trigger.triggerid,
+             trigger_name=trigger.description,
+@@ -312,6 +346,72 @@ class AvailabilityService:
+             ),
+         )
+ 
++    # Equivalente a calculate_trigger_groups(), mas busca os eventos do
++    # Zabbix em lotes (event.get com varios objectids de uma vez, em vez de
++    # 1 chamada por trigger) -- feito para o relatorio geral (ex.: todos os
++    # hosts monitorados), onde o numero de chamadas sequenciais seria
++    # proibitivo (milhares de triggers = milhares de round-trips). Ha uma
++    # pausa deliberada entre lotes (REPORT_CHUNK_DELAY_SECONDS) para nao
++    # gerar rajada de requisicoes no Zabbix -- aceita-se um relatorio mais
++    # lento em troca de nao degradar o funcionamento normal do Zabbix.
++    # on_progress(completed, total), quando informado, e chamado apos cada
++    # lote processado -- usado pelo job em background (api/report_jobs.py)
++    # para reportar progresso real ao frontend.
++    def calculate_trigger_groups_batched(
++        self,
++        trigger_keys: list[str],
++        window: AvailabilityWindow,
++        group_ids: list[str] | None = None,
++        host_ids: list[str] | None = None,
++        host_limit: int | None = None,
++        trigger_limit: int | None = None,
++        on_progress: Callable[[int, int], None] | None = None,
++    ) -> GroupTriggerAvailability:
++        trigger_groups = self.list_trigger_groups(
++            group_ids=group_ids,
++            host_ids=host_ids,
++            host_limit=host_limit,
++            trigger_limit=trigger_limit,
++        )
++        selected_by_key = {group.key: group for group in trigger_groups}
++        selected = [selected_by_key[key] for key in trigger_keys if key in selected_by_key]
++        if len(selected) != len(set(trigger_keys)):
++            raise ValueError("Uma ou mais triggers nao foram encontradas para os filtros informados.")
++
++        all_triggers = [trigger for group in selected for trigger in group.triggers]
++        total = len(all_triggers)
++        results: list[TriggerAvailability] = []
++
++        chunk_size = get_report_chunk_size()
++        delay_seconds = get_report_chunk_delay_seconds()
++        start_epoch = int(window.period_start.timestamp())
++        end_epoch = int(window.period_end.timestamp())
++
++        for chunk_start in range(0, total, chunk_size):
++            chunk = all_triggers[chunk_start:chunk_start + chunk_size]
++            chunk_ids = [trigger.triggerid for trigger in chunk]
++
++            previous_events = self.client.get_last_events_before_batch(chunk_ids, start_epoch)
++            window_events = self.client.get_events_in_window_batch(chunk_ids, start_epoch, end_epoch)
++
++            for trigger in chunk:
++                results.append(
++                    self._calculate_trigger_from_events(
++                        trigger,
++                        window,
++                        previous_event=previous_events.get(trigger.triggerid),
++                        events_in_window=window_events.get(trigger.triggerid, []),
++                    )
++                )
++
++            if on_progress is not None:
++                on_progress(len(results), total)
++
++            if chunk_start + chunk_size < total and delay_seconds > 0:
++                time.sleep(delay_seconds)
++
++        return _selection_availability(selected, results)
++
+     def _resolve_host_ids(self, group_ids: list[str], host_ids: list[str], limit: int | None) -> list[str]:
+         resolved = [host_id for host_id in host_ids if host_id]
+         if group_ids:
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 043496e..1026cca 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -3,12 +3,15 @@ import {
+   calculateGroupTrigger,
+   getHostGroups,
+   getHosts,
++  getReportResult,
++  getReportStatus,
+   getSession,
+   getTimeline,
+   getTriggerGroups,
+   login,
+   loginWithZabbixSession,
+   logout,
++  startGeneralReport,
+   ApiRequestError,
+   type AvailabilityResult,
+   type AuthSession,
+@@ -260,6 +263,8 @@ function GroupHostScreen() {
+   const [hostModalOpen, setHostModalOpen] = useState(false)
+   const [triggerModalOpen, setTriggerModalOpen] = useState(false)
+   const [savedFilters, setSavedFilters] = useState<SavedFilter[]>(() => loadSavedFilters())
++  const [useBackgroundReport, setUseBackgroundReport] = useState(false)
++  const [reportProgress, setReportProgress] = useState<{ completed: number; total: number } | null>(null)
+ 
+   useEffect(() => {
+     void loadInitialData()
+@@ -364,20 +369,42 @@ function GroupHostScreen() {
+     setBusy(true)
+     setError("")
+     setResult(null)
++    setReportProgress(null)
++    const payload = {
++      trigger_keys: selectedTriggerKeys,
++      period_start: periodStart,
++      period_end: periodEnd,
++      timezone,
++      groupids: selectedGroupIds,
++      hostids: selectedHostIds,
++    }
+     try {
+-      const calculated = await calculateGroupTrigger({
+-          trigger_keys: selectedTriggerKeys,
+-          period_start: periodStart,
+-          period_end: periodEnd,
+-          timezone,
+-          groupids: selectedGroupIds,
+-          hostids: selectedHostIds,
+-        })
+-      setResult(calculated)
++      if (useBackgroundReport) {
++        const { job_id } = await startGeneralReport(payload)
++        setResult(await pollReport(job_id))
++      } else {
++        setResult(await calculateGroupTrigger(payload))
++      }
+     } catch (caught) {
+       setError(errorText(caught))
+     } finally {
+       setBusy(false)
++      setReportProgress(null)
++    }
++  }
++
++  // Faz polling do status do relatorio em background ate ele terminar (ou
++  // falhar), atualizando o progresso exibido na tela a cada verificacao.
++  // Ver ANALISE_E_MELHORIAS.md / conversa sobre relatorio geral: o calculo
++  // roda no servidor fora do ciclo request/response para nao esbarrar em
++  // timeouts de proxy/Uvicorn em selecoes grandes (ex.: todos os hosts).
++  async function pollReport(jobId: string): Promise<GroupTriggerAvailability> {
++    while (true) {
++      const status = await getReportStatus(jobId)
++      setReportProgress({ completed: status.completed, total: status.total })
++      if (status.status === "DONE") return getReportResult(jobId)
++      if (status.status === "ERROR") throw new ApiRequestError(status.error ?? "Falha ao gerar o relatorio.", 502)
++      await new Promise((resolve) => setTimeout(resolve, 2000))
+     }
+   }
+ 
+@@ -501,6 +528,18 @@ function GroupHostScreen() {
+             <div className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_minmax(220px,1fr)_auto] lg:items-end">
+               <PeriodInputs periodStart={periodStart} periodEnd={periodEnd} timezone={timezone} minDateTime={minPeriodDateTime} onPeriodStart={setPeriodStart} onPeriodEnd={setPeriodEnd} onTimezone={setTimezone} />
+             </div>
++            <label className="mt-3 flex items-start gap-2 text-xs font-medium text-slate-600 dark:text-slate-300">
++              <input
++                className="mt-0.5"
++                type="checkbox"
++                checked={useBackgroundReport}
++                onChange={(event) => setUseBackgroundReport(event.target.checked)}
++              />
++              <span>
++                Relatório em segundo plano — recomendado para muitos hosts (ex.: todos os hosts monitorados).
++                Mais lento, mas evita sobrecarregar o Zabbix e não trava a tela.
++              </span>
++            </label>
+             <div className="mt-4 flex gap-3">
+               <button className="h-11 flex-1 rounded-md border border-emerald-600 bg-emerald-600 px-5 text-sm font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-wait disabled:opacity-60" disabled={busy || triggersLoading || selectedTriggerKeys.length === 0}>
+                 {busy ? "Processando" : "Calcular disponibilidade"}
+@@ -518,7 +557,21 @@ function GroupHostScreen() {
+           <section className={`${panelClass} grid min-h-40 content-center justify-items-center gap-3 text-center`}>
+             <span className="h-8 w-8 animate-spin rounded-full border-4 border-slate-200 border-t-emerald-600 dark:border-slate-700 dark:border-t-emerald-400" />
+             <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">Calculando disponibilidade...</p>
+-            <p className="text-xs text-slate-500 dark:text-slate-400">Aguarde enquanto os eventos da janela selecionada são consultados.</p>
++            {reportProgress && reportProgress.total > 0 ? (
++              <div className="w-full max-w-sm">
++                <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700">
++                  <div
++                    className="h-2 bg-emerald-500 transition-all"
++                    style={{ width: `${Math.round((reportProgress.completed / reportProgress.total) * 100)}%` }}
++                  />
++                </div>
++                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
++                  {reportProgress.completed} de {reportProgress.total} triggers calculadas
++                </p>
++              </div>
++            ) : (
++              <p className="text-xs text-slate-500 dark:text-slate-400">Aguarde enquanto os eventos da janela selecionada são consultados.</p>
++            )}
+           </section>
+         ) : result ? (
+           <section className="grid gap-6">
+diff --git a/frontend/src/api.ts b/frontend/src/api.ts
+index 658cd7c..9d41bbd 100644
+--- a/frontend/src/api.ts
++++ b/frontend/src/api.ts
+@@ -178,20 +178,23 @@ export async function getHostGroups(search: string): Promise<HostGroup[]> {
+   return data.groups
+ }
+ 
++// Via POST (corpo, nao query string): groupids/hostids podem ter
++// centenas/milhares de itens (ex.: selecionar todos os hosts monitorados),
++// o que estourava o limite de tamanho de URL (HTTP 414) quando ia via GET
++// com parametros repetidos. Ver backend/src/api/routes.py.
+ export async function getHosts(search: string, groupids: string[] = []): Promise<Host[]> {
+-  const params = new URLSearchParams()
+-  if (search.trim()) params.set("search", search.trim())
+-  for (const groupid of groupids) params.append("groupids", groupid)
+-  const data = await request<{ hosts: Host[] }>(`/api/hosts?${params.toString()}`)
++  const data = await request<{ hosts: Host[] }>("/api/hosts/search", {
++    method: "POST",
++    body: JSON.stringify({ search: search.trim() || null, groupids }),
++  })
+   return data.hosts
+ }
+ 
+ export async function getTriggerGroups(groupids: string[], hostids: string[], search: string): Promise<TriggerGroup[]> {
+-  const params = new URLSearchParams()
+-  if (search.trim()) params.set("search", search.trim())
+-  for (const groupid of groupids) params.append("groupids", groupid)
+-  for (const hostid of hostids) params.append("hostids", hostid)
+-  const data = await request<{ triggers: TriggerGroup[] }>(`/api/triggers?${params.toString()}`)
++  const data = await request<{ triggers: TriggerGroup[] }>("/api/triggers/search", {
++    method: "POST",
++    body: JSON.stringify({ groupids, hostids, search: search.trim() || null }),
++  })
+   return data.triggers
+ }
+ 
+@@ -211,6 +214,32 @@ export async function calculateGroupTrigger(
+   })
+ }
+ 
++// --- Relatorio geral em background (muitos hosts/triggers). O calculo
++// roda no servidor fora do ciclo request/response HTTP; o cliente inicia
++// o job, faz polling de status (com progresso) e busca o resultado quando
++// pronto. Ver backend/src/api/report_jobs.py. ---
++export type ReportJobStatus = {
++  status: "PENDING" | "RUNNING" | "DONE" | "ERROR"
++  completed: number
++  total: number
++  error: string | null
++}
++
++export async function startGeneralReport(payload: GroupTriggerAvailabilityRequest): Promise<{ job_id: string }> {
++  return request("/api/availability/report/start", {
++    method: "POST",
++    body: JSON.stringify(payload),
++  })
++}
++
++export async function getReportStatus(jobId: string): Promise<ReportJobStatus> {
++  return request(`/api/availability/report/${jobId}/status`)
++}
++
++export async function getReportResult(jobId: string): Promise<GroupTriggerAvailability> {
++  return request(`/api/availability/report/${jobId}/result`)
++}
++
+ // Wrapper unico sobre fetch(): adiciona o X-Request-Id, credenciais
+ // (cookie de sessao), loga cada chamada (ver logger.ts) e converte
+ // respostas de erro em ApiRequestError com mensagem pronta para exibir.
